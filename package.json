@@ -1,0 +1,12 @@
+{
+  "name": "magpie-runable-auth",
+  "version": "0.1.0",
+  "description": "Runable provider plugin for Magpie: Claude models via a Runable session token",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": { ".": "./index.mjs" },
+  "files": ["index.mjs", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "magpie", "runable", "provider"],
+  "license": "MIT",
+  "magpie": { "maxConcurrency": 2, "icon": "https://runable.com/favicon.ico" }
+}
