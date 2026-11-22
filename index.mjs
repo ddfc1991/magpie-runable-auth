@@ -213,7 +213,22 @@ export async function RunablePlugin() {
             const messages = body.messages || [];
             let content = prompt(messages);
             const tools = body.tools || body.functions || null;
-            if (tools) content = TOOL_INSTRUCTION.replace("{tools}", toolBrief(tools)) + "\n\n" + content;
+            // Runable 上游对单条 message 文本有约 8000 字符的硬限制,超过即返回 HTTP 400。
+            // 把所有历史拼成一条巨型文本必然超限——按安全上限截断,保留工具指令(完整)+最近对话。
+            const MAX_CHARS = 7800;
+            const instr = tools ? TOOL_INSTRUCTION.replace("{tools}", toolBrief(tools)) + "\n\n" : "";
+            if (instr.length + content.length > MAX_CHARS) {
+              const budget = Math.max(200, MAX_CHARS - instr.length);
+              const head = Math.min(400, Math.floor(budget / 3));
+              const tail = Math.max(120, budget - head - 60);
+              if (content.length > head + tail + 60) {
+                const dropped = content.length - head - tail;
+                content = content.slice(0, head) + `\n...[truncated ${dropped} chars; oldest context dropped to fit Runable limit]...\n` + content.slice(-tail);
+              } else {
+                content = content.slice(0, budget);
+              }
+            }
+            content = instr + content;
 
             const payload = {
               id: randomUUID(),
