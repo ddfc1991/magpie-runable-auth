@@ -1,6 +1,6 @@
 {
   "name": "magpie-runable-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Runable provider plugin for Magpie: Claude models via a Runable session token",
   "type": "module",
   "main": "./index.mjs",
