@@ -25,7 +25,7 @@ const LIMIT = { context: 200000, output: 32000 };
 // Cooldowns: how long a token is benched after a given upstream status.
 const BENCH_MS = { 401: 6 * 3600e3, 402: 3600e3, 403: 600e3, 429: 60e3 };
 // 本地计数口径：一个号一天大致能用的免费调用量（仅用于进度条，不是官方额度）
-const DAILY_SOFT_CAP = 200;
+const DAILY_SOFT_CAP = 1500;
 
 function parseTokens(raw) {
   if (!raw) return [];
