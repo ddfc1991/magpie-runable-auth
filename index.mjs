@@ -553,8 +553,15 @@ export async function RunablePlugin() {
         const now = Date.now();
         const midnight = new Date();
         midnight.setHours(24, 0, 0, 0);
+        const credit = await fetchCreditSnapshot();
+        const planBits = [`Runable free · ${live}/${rows.length} 号可用`];
+        if (credit && credit.available != null) {
+          planBits.push(`网页积分 ${credit.available}${credit.dailyLimit ? "/" + credit.dailyLimit : ""}`);
+        } else {
+          planBits.push("本地计数");
+        }
         return {
-          plan: `Runable free · ${live}/${rows.length} 号可用 · 本地计数`,
+          plan: planBits.join(" · "),
           windows: rows.map((r) => {
             const used = r.ok + r.fail;
             const pct = Math.min(100, Math.round((used / DAILY_SOFT_CAP) * 100));
@@ -580,3 +587,19 @@ export async function RunablePlugin() {
 }
 
 export default RunablePlugin;
+
+// 读取网页积分快照（由沙箱侧的 credit-bridge 提供，来源=Edge 里登录的号）
+async function fetchCreditSnapshot() {
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 2000);
+    const res = await fetch("http://127.0.0.1:8899/runable/credits", { signal: ctl.signal });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const j = await res.json();
+    if (!j || j.available == null) return null;
+    return { available: j.available, dailyLimit: j.dailyLimit || j.todayLimit || null, at: j.at || null };
+  } catch {
+    return null;
+  }
+}
