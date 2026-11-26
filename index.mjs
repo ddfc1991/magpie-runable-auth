@@ -565,7 +565,11 @@ export async function RunablePlugin() {
           windows: rows.map((r) => {
             const used = r.ok + r.fail;
             const pct = Math.min(100, Math.round((used / DAILY_SOFT_CAP) * 100));
-            const bits = [`${used} 次调用`, `成 ${r.ok} / 败 ${r.fail}`];
+            const bits = [];
+            if (credit && credit.available != null) {
+              bits.push(`积分 ${credit.available}${credit.dailyLimit ? "/" + credit.dailyLimit : ""}`);
+            }
+            bits.push(`${used} 次调用`, `成 ${r.ok} / 败 ${r.fail}`);
             if (r.outTok) bits.push(`${r.outTok} tok`);
             if (r.chars) bits.push(`${(r.chars / 1000).toFixed(1)}k 字`);
             bits.push(
