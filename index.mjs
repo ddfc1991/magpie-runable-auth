@@ -24,6 +24,8 @@ const LIMIT = { context: 200000, output: 32000 };
 
 // Cooldowns: how long a token is benched after a given upstream status.
 const BENCH_MS = { 401: 6 * 3600e3, 402: 3600e3, 403: 600e3, 429: 60e3 };
+// 本地计数口径：一个号一天大致能用的免费调用量（仅用于进度条，不是官方额度）
+const DAILY_SOFT_CAP = 200;
 
 function parseTokens(raw) {
   if (!raw) return [];
@@ -34,19 +36,23 @@ function parseTokens(raw) {
   return [...new Set(list)];
 }
 
+function newStats() {
+  return { ok: 0, fail: 0, inTok: 0, outTok: 0, chars: 0, lastUsed: 0, lastStatus: 0, lastError: "" };
+}
+
 const POOL = {
   tokens: [],
-  cursor: 0,
   bench: new Map(), // token -> { until, status }
-  stats: new Map(), // token -> { ok, fail }
+  stats: new Map(), // token -> { ok, fail, inTok, outTok, chars, lastUsed, lastStatus, lastError }
+  callLog: [], // 最近 50 次调用：{ at, model, ms, status, who, ok }
 
   load(raw) {
     const next = parseTokens(raw);
     if (next.join() !== this.tokens.join()) {
+      const prev = this.stats;
       this.tokens = next;
-      this.cursor = 0;
       this.bench = new Map();
-      this.stats = new Map(next.map((t) => [t, { ok: 0, fail: 0 }]));
+      this.stats = new Map(next.map((t) => [t, prev.get(t) || newStats()]));
     }
   },
   alive() {
@@ -56,24 +62,52 @@ const POOL = {
       return !b || b.until <= now;
     });
   },
+  // 自动切换：优先挑「用得最少、且最久没用」的号；停用中的自动跳过
   pick() {
     const live = this.alive();
     if (!live.length) return null;
-    const t = live[this.cursor % live.length];
-    this.cursor = (this.cursor + 1) % Math.max(1, live.length);
-    return t;
+    let best = live[0];
+    let bestUsed = Infinity;
+    let bestLast = Infinity;
+    for (const t of live) {
+      const s = this.stats.get(t) || newStats();
+      const used = s.ok + s.fail;
+      if (used < bestUsed || (used === bestUsed && s.lastUsed < bestLast)) {
+        best = t;
+        bestUsed = used;
+        bestLast = s.lastUsed;
+      }
+    }
+    return best;
   },
-  ok(token) {
-    const s = this.stats.get(token) || { ok: 0, fail: 0 };
+  ok(token, info) {
+    const s = this.stats.get(token) || newStats();
     s.ok++;
+    s.lastUsed = Date.now();
+    s.lastStatus = 200;
+    s.lastError = "";
+    if (info) {
+      if (info.inTok) s.inTok += info.inTok;
+      if (info.outTok) s.outTok += info.outTok;
+      if (info.chars) s.chars += info.chars;
+    }
     this.stats.set(token, s);
+    this.log({ ok: true, status: 200, who: this.mask(token), model: info?.model, ms: info?.ms });
   },
-  fail(token, status) {
-    const s = this.stats.get(token) || { ok: 0, fail: 0 };
+  fail(token, status, info) {
+    const s = this.stats.get(token) || newStats();
     s.fail++;
+    s.lastUsed = Date.now();
+    s.lastStatus = status;
+    s.lastError = info?.error || "";
     this.stats.set(token, s);
     const ms = BENCH_MS[status];
     if (ms) this.bench.set(token, { until: Date.now() + ms, status });
+    this.log({ ok: false, status, who: this.mask(token), model: info?.model, ms: info?.ms, error: s.lastError });
+  },
+  log(entry) {
+    this.callLog.unshift({ at: Date.now(), ...entry });
+    if (this.callLog.length > 50) this.callLog.length = 50;
   },
   mask(t) {
     return t ? t.slice(0, 6) + "…" + t.slice(-4) + " (" + t.length + ")" : "?";
@@ -86,7 +120,18 @@ const POOL = {
     }
     return out;
   },
+  // 每个号的用量快照（给 Magpie 账号页展示）
+  report() {
+    const now = Date.now();
+    return this.tokens.map((t, i) => {
+      const s = this.stats.get(t) || newStats();
+      const b = this.bench.get(t);
+      const benched = b && b.until > now ? Math.ceil((b.until - now) / 1000) : 0;
+      return { index: i + 1, who: this.mask(t), ...s, benched };
+    });
+  },
 };
+
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -384,6 +429,7 @@ export async function RunablePlugin() {
           let lastStatus = null;
           let lastMsg = "No Runable session available";
           const tried = [];
+          const startedAt = Date.now();
 
           for (let i = 0; i < attempts; i++) {
             const token = POOL.pick();
@@ -413,7 +459,7 @@ export async function RunablePlugin() {
             }
 
             if (upstream.ok) {
-              POOL.ok(token);
+              POOL.ok(token, { model, ms: Date.now() - startedAt, chars: 0 });
               if (body.stream === false) {
                 // Drain into a single completion for non-streaming clients.
                 const raw = await upstream.text();
@@ -461,7 +507,7 @@ export async function RunablePlugin() {
               }[upstream.status] || `Runable returned HTTP ${upstream.status}`;
 
             if ([401, 402, 403, 429].includes(upstream.status)) {
-              POOL.fail(token, upstream.status);
+              POOL.fail(token, upstream.status, { model, ms: Date.now() - startedAt, error: lastMsg });
               try {
                 await upstream.body?.cancel();
               } catch {}
@@ -472,6 +518,18 @@ export async function RunablePlugin() {
 
           const benched = POOL.benchInfo();
           const detail = benched.length ? ` (benched: ${benched.join(", ")})` : "";
+
+          // Single-token credential (= one Magpie account): a 401 means this
+          // account's login died. Flag it so Magpie marks it "needs sign-in"
+          // instead of silently retrying forever.
+          if (lastStatus === 401 && POOL.tokens.length === 1) {
+            const err = new Error(
+              "Runable 登录态已失效（401），请在 Magpie 里重新登录这个账号"
+            );
+            err.signIn = "expired";
+            throw err;
+          }
+
           return new Response(
             JSON.stringify({
               error: {
@@ -489,11 +547,32 @@ export async function RunablePlugin() {
       async usage(getAuth) {
         const auth = await getAuth?.();
         if (!auth) return { plan: "Runable", windows: [] };
-        const total = POOL.tokens.length;
-        const live = POOL.alive().length;
+        POOL.load(auth.key);
+        const rows = POOL.report();
+        const live = rows.filter((r) => !r.benched).length;
+        const now = Date.now();
+        const midnight = new Date();
+        midnight.setHours(24, 0, 0, 0);
         return {
-          plan: `Runable free (${live}/${total} accounts alive)`,
-          windows: POOL.benchInfo().map((b) => ({ label: b, used: 0, limit: 0 })),
+          plan: `Runable free · ${live}/${rows.length} 号可用 · 本地计数`,
+          windows: rows.map((r) => {
+            const used = r.ok + r.fail;
+            const pct = Math.min(100, Math.round((used / DAILY_SOFT_CAP) * 100));
+            const bits = [`${used} 次调用`, `成 ${r.ok} / 败 ${r.fail}`];
+            if (r.outTok) bits.push(`${r.outTok} tok`);
+            if (r.chars) bits.push(`${(r.chars / 1000).toFixed(1)}k 字`);
+            bits.push(
+              r.lastUsed ? `最近 ${Math.max(0, Math.round((now - r.lastUsed) / 60000))} 分钟前` : "未使用"
+            );
+            if (r.benched) bits.push(`停用 ${r.benched}s（HTTP${r.lastStatus}）`);
+            return {
+              name: `号${r.index} ${r.who}`,
+              used: pct,
+              resetsAt: midnight.toISOString(),
+              span: 86400,
+              display: bits.join(" · "),
+            };
+          }),
         };
       },
     },
