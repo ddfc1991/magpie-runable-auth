@@ -18,11 +18,12 @@ ok(ids.every((i) => p.models[i].cost.input === 0), "all models cost 0");
 ok(ids.includes("anthropic/claude-sonnet-5.5"), "sonnet-5.5 present");
 ok(ids.includes("anthropic/claude-haiku-5.5"), "haiku-5.5 present");
 
-// ---------- 2. multi-token parsing
-const a = await auth.authorize({ token: "tok-aaaaaaaa\n tok-bbbbbbbb\nBearer tok-cccccccc\ntok-aaaaaaaa" });
-ok(a.type === "success", "authorize accepts multiple tokens");
-ok(a.key.split("\n").length === 3, "dedupes + strips Bearer -> 3 tokens (" + a.key.split("\n").length + ")");
-ok(!/Bearer/.test(a.key), "no 'Bearer' left in stored tokens");
+// ---------- 2. single-token contract (multi-account = login N times)
+const a = await auth.authorize({ token: "Bearer tok-single-aaaaaaaa" });
+ok(a.type === "success", "authorize accepts single token");
+ok(a.key === "tok-single-aaaaaaaa", "strips Bearer");
+const multi = await auth.authorize({ token: "tok-a\ntok-b" });
+ok(multi.type === "failed", "multiple tokens in one login rejected (tell user to login N times)");
 const bad = await auth.authorize({ token: "   " });
 ok(bad.type === "failed", "blank token rejected");
 
@@ -63,39 +64,36 @@ ok(text.includes('"content":"你好"') && text.includes('"content":"，世界"')
 ok(text.includes('"reasoning_content":"想"'), "stream: reasoning forwarded");
 ok(text.trim().endsWith("data: [DONE]"), "stream: ends with [DONE]");
 
-// ---------- 5. rotation on 401 (fresh token set -> pool resets, cursor at 0)
+// ---------- 5. 401 -> signIn=expired (Magpie marks account, rotates itself)
 calls = [];
-const DEAD = "rot-1-deaddead";
-const LIVE = "rot-2-livelive";
-const rot = await plugin.auth.loader(async () => ({ key: DEAD + " " + LIVE }));
-mockUpstream((tok) => (tok === DEAD ? new Response("no", { status: 401 }) : new Response(SSE_OK, { status: 200 })));
-res = await rot.fetch("x", { method: "POST", body: reqBody() });
-text = await res.text();
-ok(res.status === 200, "rotation: succeeds on 2nd account after 401");
-ok(calls.length === 2, "rotation: exactly 2 upstream calls (" + calls.length + ")");
-ok(calls[0].tok !== calls[1].tok, "rotation: used two different tokens");
-ok(text.includes("你好"), "rotation: streamed content from live account");
-
-// ---------- 6. dead token is now benched (skipped)
-calls = [];
-res = await rot.fetch("x", { method: "POST", body: reqBody() });
-await res.text();
-ok(!calls.some((c) => c.tok === DEAD), "benched 401 token is skipped on later calls");
-ok(calls.length === 1, "benched: only one upstream call (" + calls.length + ")");
-
-// ---------- 7. all accounts dead -> actionable error
-calls = [];
+const rot = await plugin.auth.loader(async () => ({ key: "rot-1-deaddead" }));
 mockUpstream(() => new Response("no", { status: 401 }));
-const fresh = await plugin.auth.loader(async () => ({ key: "tok-x-11111111 tok-x-22222222" }));
-const deadRes = await fresh.fetch("x", { method: "POST", body: reqBody() });
-const deadJson = await deadRes.json();
-ok(deadRes.status === 401, "all-dead: 401 status");
-ok(/tried \d+\/2 account/.test(deadJson.error.message), "all-dead: reports accounts tried");
-ok(/benched/.test(deadJson.error.message), "all-dead: reports bench state");
+let expiredErr = null;
+try { await rot.fetch("x", { method: "POST", body: reqBody() }); } catch (e) { expiredErr = e; }
+ok(expiredErr && expiredErr.signIn === "expired", "401 -> throws signIn=expired");
+ok(calls.length === 1, "401: single upstream call (rotation is Magpie's job)");
+
+// ---------- 6. 429 -> status 429 passthrough (Magpie retries on another account)
+calls = [];
+const rl = await plugin.auth.loader(async () => ({ key: "rl-1-aaaaaaaa" }));
+mockUpstream(() => new Response("slow down", { status: 429 }));
+const rlRes = await rl.fetch("x", { method: "POST", body: reqBody() });
+const rlJson = await rlRes.json();
+ok(rlRes.status === 429, "429 -> status 429 (" + rlRes.status + ")");
+ok(/rate limited/.test(rlJson.error.message), "429: actionable message");
+ok(/slow down/.test(rlJson.error.message), "429: upstream body included");
+
+// ---------- 6b. 402 -> 502 (credits exhausted, Magpie rotates)
+calls = [];
+const ex = await plugin.auth.loader(async () => ({ key: "ex-1-aaaaaaaa" }));
+mockUpstream(() => new Response("no credits", { status: 402 }));
+const exRes = await ex.fetch("x", { method: "POST", body: reqBody() });
+ok(exRes.status === 502, "402 -> 502 for rotation (" + exRes.status + ")");
+ok(/credits exhausted/.test((await exRes.json()).error.message), "402: message");
 
 // ---------- 8. free-model gate (fresh healthy pool)
 calls = [];
-const good = await plugin.auth.loader(async () => ({ key: "good-1-aaaaaaa good-2-bbbbbbb" }));
+const good = await plugin.auth.loader(async () => ({ key: "good-1-aaaaaaa" }));
 mockUpstream(() => new Response(SSE_OK, { status: 200 }));
 const paid = await good.fetch("x", { method: "POST", body: reqBody({ model: "anthropic/claude-opus-5.5" }) });
 const paidJson = await paid.json();

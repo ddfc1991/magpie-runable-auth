@@ -341,24 +341,23 @@ export async function RunablePlugin() {
       methods: [
         {
           type: "api",
-          label: "Runable session tokens",
-          placeholder: "one or more session tokens, separated by spaces/newlines",
+          label: "Runable 会话 token（一个账号登录一次，多号就多登录几次）",
+          placeholder: "一个 runable.com session token",
           prompts: [
             {
               type: "password",
               key: "token",
-              message: "Runable session token(s) — 多号用换行/空格分隔",
-              placeholder: "tok1 tok2 tok3 … (登录 runable.com 后从 cookie 取)",
-              validate: (v) => (parseTokens(v).length ? undefined : "At least one token required"),
+              message: "Runable session token（单个；多号请多次登录）",
+              placeholder: "登录 runable.com 后从请求头 Bearer 取",
+              validate: (v) => (parseTokens(v).length === 1 ? undefined : "需要恰好 1 个 token（多号请分开多次登录）"),
             },
           ],
           async authorize(input, inputs) {
             const obj = input && typeof input === "object" && !Array.isArray(input) ? input : inputs || {};
             const raw = (typeof input === "string" && input.trim()) || obj.token || obj.key || "";
             const tokens = parseTokens(raw);
-            if (!tokens.length) return { type: "failed", error: "At least one token required" };
-            // Multiple tokens are stored newline-joined under the single key.
-            return { type: "success", key: tokens.join("\n") };
+            if (tokens.length !== 1) return { type: "failed", error: "每次登录填 1 个 token；多号请多次登录（Magpie 会自动轮换）" };
+            return { type: "success", key: tokens[0] };
           },
         },
       ],
@@ -369,7 +368,7 @@ export async function RunablePlugin() {
         const raw = auth.key ?? auth.methods?.[0]?.key ?? "";
         const tokens = parseTokens(raw);
         if (!tokens.length) return {};
-        POOL.load(tokens.join(" "));
+        const token = tokens[0]; // 单账号：这个 loader 实例只对应一个号
 
         async function runableFetch(input, init) {
           let bodyText = typeof init?.body === "string" ? init.body : null;
@@ -425,17 +424,10 @@ export async function RunablePlugin() {
           };
 
           // ---- try each healthy token in turn
-          const attempts = Math.max(1, POOL.alive().length);
-          let lastStatus = null;
           let lastMsg = "No Runable session available";
-          const tried = [];
           const startedAt = Date.now();
 
-          for (let i = 0; i < attempts; i++) {
-            const token = POOL.pick();
-            if (!token) break;
-            tried.push(POOL.mask(token));
-
+          {
             let upstream;
             try {
               upstream = await fetch(CHAT_URL, {
@@ -446,16 +438,17 @@ export async function RunablePlugin() {
                   Accept: "text/event-stream",
                   Origin: "https://runable.com",
                   Referer: "https://runable.com/",
-                  "User-Agent": "Mozilla/5.0 (Linux; Android 14) MagpieRunable/1.0.0",
+                  "User-Agent": "Mozilla/5.0 (Linux; Android 14) MagpieRunable/1.1.0",
                   "x-runable-device": "dweb/a69d4f72ddd711c660237adaf5c76287ac5473f5",
                 },
                 body: JSON.stringify(payload),
                 signal: init?.signal,
               });
             } catch (e) {
-              lastStatus = 502;
-              lastMsg = "Runable connection failed: " + String(e && e.message || e).slice(0, 200);
-              continue;
+              return new Response(
+                JSON.stringify({ error: { message: "Runable connection failed: " + String(e && e.message || e).slice(0, 200), type: "upstream_error" } }),
+                { status: 502, headers: { "content-type": "application/json" } }
+              );
             }
 
             if (upstream.ok) {
@@ -497,7 +490,7 @@ export async function RunablePlugin() {
               });
             }
 
-            lastStatus = upstream.status;
+            const upstreamStatus = upstream.status;
             lastMsg =
               {
                 401: "Runable session expired",
@@ -506,38 +499,41 @@ export async function RunablePlugin() {
                 429: "Runable rate limited this request",
               }[upstream.status] || `Runable returned HTTP ${upstream.status}`;
 
-            if ([401, 402, 403, 429].includes(upstream.status)) {
-              POOL.fail(token, upstream.status, { model, ms: Date.now() - startedAt, error: lastMsg });
-              try {
-                await upstream.body?.cancel();
-              } catch {}
-              continue; // try the next account
+            // 抓上游真实报错体，别只报一个状态码
+            let errBody = "";
+            try {
+              errBody = (await upstream.text()).slice(0, 300);
+            } catch {
+              try { await upstream.body?.cancel(); } catch {}
             }
-            break; // non-account error: don't burn the other tokens
+            if (errBody) lastMsg += ` — ${errBody.replace(/\s+/g, " ").trim()}`;
+
+            POOL.fail(token, upstreamStatus, { model, ms: Date.now() - startedAt, error: lastMsg });
+
+            // 401 = 这个账号登录态死了：标记给 Magpie（账号页显示需重登，路由自动绕开）
+            if (upstreamStatus === 401) {
+              const err = new Error(lastMsg);
+              err.signIn = "expired";
+              throw err;
+            }
+            // 402/403/429 交给 Magpie 换下一个账号重试
+            return new Response(
+              JSON.stringify({ error: { message: lastMsg, type: "upstream_error" } }),
+              { status: upstream.status === 429 ? 429 : 502, headers: { "content-type": "application/json" } }
+            );
           }
 
           const benched = POOL.benchInfo();
-          const detail = benched.length ? ` (benched: ${benched.join(", ")})` : "";
-
-          // Single-token credential (= one Magpie account): a 401 means this
-          // account's login died. Flag it so Magpie marks it "needs sign-in"
-          // instead of silently retrying forever.
-          if (lastStatus === 401 && POOL.tokens.length === 1) {
-            const err = new Error(
-              "Runable 登录态已失效（401），请在 Magpie 里重新登录这个账号"
-            );
-            err.signIn = "expired";
-            throw err;
-          }
+          const detail = benched.length ? ` (本地: ${benched.join(", ")})` : "";
 
           return new Response(
             JSON.stringify({
               error: {
-                message: `${lastMsg}. tried ${tried.length}/${POOL.tokens.length} account(s)${detail}`,
+                message: `${lastMsg}${detail}`,
                 type: "upstream_error",
               },
             }),
-            { status: lastStatus || 429, headers: { "content-type": "application/json" } }
+            { status: upstreamStatus === 429 ? 429 : 502, headers: { "content-type": "application/json" } }
           );
         }
 

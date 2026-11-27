@@ -1,7 +1,7 @@
 {
   "name": "magpie-runable-auth",
-  "version": "1.2.3",
-  "description": "Runable provider plugin for Magpie: free Claude models, multi-account rotation, per-account usage tracking",
+  "version": "2.0.0",
+  "description": "Runable provider plugin for Magpie: free Claude models, one token per login (true multi-account via Magpie rotation)",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
