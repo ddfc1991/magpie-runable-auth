@@ -15,7 +15,6 @@ const SDK = "@ai-sdk/openai-compatible";
 // on purpose — everything here costs 0 credits.
 const MODELS = {
   "anthropic/claude-sonnet-5.5": { name: "Claude Sonnet 5.5" },
-  "anthropic/claude-sonnet-5.0": { name: "Claude Sonnet 5.0" },
   "anthropic/claude-haiku-5.5": { name: "Claude Haiku 5.5" },
 };
 const LIMIT = { context: 200000, output: 32000 };

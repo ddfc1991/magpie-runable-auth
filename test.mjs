@@ -12,7 +12,7 @@ await plugin.config(cfg);
 const p = cfg.provider.runable;
 const ids = Object.keys(p.models);
 ok(!!p, "provider 'runable' registered");
-ok(ids.length === 3, "only 3 free models (" + ids.length + ")");
+ok(ids.length === 2, "only 2 working free models (" + ids.length + ")");
 ok(!ids.some((i) => /opus|fable/i.test(i)), "no paid models (opus/fable excluded)");
 ok(ids.every((i) => p.models[i].cost.input === 0), "all models cost 0");
 ok(ids.includes("anthropic/claude-sonnet-5.5"), "sonnet-5.5 present");
