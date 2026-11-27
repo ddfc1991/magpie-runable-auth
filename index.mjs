@@ -400,14 +400,16 @@ export async function RunablePlugin() {
             });
           }
           const MAX_CHARS = 7800;
-          const instr = tools ? TOOL_INSTRUCTION.replace("{tools}", toolBrief(tools)) + "\n\n" : "";
-          if (instr.length + content.length > MAX_CHARS) {
-            const budget = Math.max(200, MAX_CHARS - instr.length);
-            // Reserve room for the truncation marker itself, otherwise the
-            // final string overshoots the cap by the marker length.
+          let instr = tools ? TOOL_INSTRUCTION.replace("{tools}", toolBrief(tools)) + "\n\n" : "";
+          // 工具很多时 instr 本身就会爆掉 8000，先给它封顶（最多占 40%）
+          const INSTR_CAP = Math.floor(MAX_CHARS * 0.4);
+          if (instr.length > INSTR_CAP) {
+            instr = instr.slice(0, INSTR_CAP) + "\n…[tools truncated to fit Runable limit]\n\n";
+          }
+          const budget = Math.max(200, MAX_CHARS - instr.length);
+          if (content.length > budget) {
             const mk = (n) => `\n...[truncated ${n} chars; oldest context dropped to fit Runable limit]...\n`;
-            const reserve = mk(999999).length;
-            const usable = Math.max(120, budget - reserve);
+            const usable = Math.max(120, budget - mk(999999).length);
             const head = Math.min(400, Math.floor(usable / 3));
             const tail = Math.max(60, usable - head);
             const dropped = Math.max(0, content.length - head - tail);
@@ -415,6 +417,8 @@ export async function RunablePlugin() {
             if (content.length > budget) content = content.slice(0, budget);
           }
           content = instr + content;
+          // 最终硬保护：无论上面怎么算，发出去的文本绝不超过 Runable 8000 上限
+          if (content.length > MAX_CHARS) content = content.slice(0, MAX_CHARS);
 
           const payload = {
             id: randomUUID(),
